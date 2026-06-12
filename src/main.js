@@ -20,6 +20,14 @@ camera.position.set(0, 1.6, 1.5);
 const listener = new THREE.AudioListener();
 scene.add(listener);
 
+// Player rig. The headset tracks freely WITHIN this group (bounded by your
+// physical guardian); moving the group is how we add virtual locomotion so you
+// can travel beyond your room. The camera's own offset is only used on desktop —
+// in XR three.js drives the eyes from the headset pose times the rig transform.
+const player = new THREE.Group();
+player.add(camera);
+scene.add(player);
+
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -71,8 +79,8 @@ window.addEventListener("mousemove", (e) => {
 const keys = new Set();
 window.addEventListener("keydown", (e) => keys.add(e.code));
 window.addEventListener("keyup", (e) => keys.delete(e.code));
-const MOVE_SPEED = 2.2; // metres/sec
-const FLOOR_RADIUS = 11;
+const MOVE_SPEED = 2.6; // metres/sec
+const FLOOR_RADIUS = 24;
 
 function moveDesktop(dt) {
   const fwd = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
@@ -83,10 +91,68 @@ function moveDesktop(dt) {
   // forward = (-sin, 0, -cos), right = (cos, 0, -sin)
   camera.position.x += (fwd * -s + strafe * c) * MOVE_SPEED * dt;
   camera.position.z += (fwd * -c + strafe * -s) * MOVE_SPEED * dt;
-  const r = Math.hypot(camera.position.x, camera.position.z);
+  clampToFloor(camera.position);
+}
+
+// --- VR locomotion: left stick glides, right stick snap-turns ---------------
+const VR_MOVE_SPEED = 2.6;
+const SNAP_ANGLE = Math.PI / 6; // 30°
+const DEADZONE = 0.18;
+const _yAxis = new THREE.Vector3(0, 1, 0);
+const _pivot = new THREE.Vector3();
+const _headQuat = new THREE.Quaternion();
+let snapReady = true;
+
+function clampToFloor(pos) {
+  const r = Math.hypot(pos.x, pos.z);
   if (r > FLOOR_RADIUS) {
-    camera.position.x *= FLOOR_RADIUS / r;
-    camera.position.z *= FLOOR_RADIUS / r;
+    pos.x *= FLOOR_RADIUS / r;
+    pos.z *= FLOOR_RADIUS / r;
+  }
+}
+
+function moveVR(dt) {
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  let mx = 0;
+  let mz = 0;
+  let turn = 0;
+  for (const src of session.inputSources) {
+    const ax = src.gamepad?.axes;
+    if (!ax) continue;
+    const x = ax.length > 2 ? ax[2] : ax[0] || 0; // thumbstick X
+    const y = ax.length > 3 ? ax[3] : ax[1] || 0; // thumbstick Y
+    if (src.handedness === "right") turn += x;
+    else {
+      mx += x;
+      mz += y;
+    }
+  }
+
+  // Smooth glide, relative to where the head is facing.
+  if (Math.hypot(mx, mz) > DEADZONE) {
+    renderer.xr.getCamera().getWorldQuaternion(_headQuat);
+    _camEuler.setFromQuaternion(_headQuat, "YXZ");
+    const s = Math.sin(_camEuler.y);
+    const c = Math.cos(_camEuler.y);
+    const fwd = -mz;
+    const strafe = mx;
+    player.position.x += (fwd * -s + strafe * c) * VR_MOVE_SPEED * dt;
+    player.position.z += (fwd * -c + strafe * -s) * VR_MOVE_SPEED * dt;
+    clampToFloor(player.position);
+  }
+
+  // Snap-turn around the head so the world pivots in place.
+  if (Math.abs(turn) > 0.7 && snapReady) {
+    snapReady = false;
+    const angle = turn > 0 ? -SNAP_ANGLE : SNAP_ANGLE;
+    renderer.xr.getCamera().getWorldPosition(_pivot);
+    player.position.sub(_pivot);
+    player.position.applyAxisAngle(_yAxis, angle);
+    player.position.add(_pivot);
+    player.rotateY(angle);
+  } else if (Math.abs(turn) < 0.3) {
+    snapReady = true;
   }
 }
 
@@ -99,13 +165,13 @@ sun.position.set(4, 10, 2);
 scene.add(sun);
 
 const floor = new THREE.Mesh(
-  new THREE.CircleGeometry(12, 48),
+  new THREE.CircleGeometry(25, 64),
   new THREE.MeshStandardMaterial({ color: 0x161d33, roughness: 0.95 })
 );
 floor.rotation.x = -Math.PI / 2;
 scene.add(floor);
 
-scene.add(new THREE.GridHelper(24, 24, 0x3a4a7a, 0x223052));
+scene.add(new THREE.GridHelper(50, 50, 0x3a4a7a, 0x223052));
 
 const originRing = new THREE.Mesh(
   new THREE.RingGeometry(0.32, 0.4, 40),
@@ -125,7 +191,7 @@ const gripL = renderer.xr.getControllerGrip(0);
 const gripR = renderer.xr.getControllerGrip(1);
 gripL.add(new THREE.Mesh(ownHandGeo, ownHandMat));
 gripR.add(new THREE.Mesh(ownHandGeo, ownHandMat));
-scene.add(gripL, gripR);
+player.add(gripL, gripR);
 
 let leftLive = false;
 let rightLive = false;
@@ -135,7 +201,7 @@ ctrl0.addEventListener("connected", () => (leftLive = true));
 ctrl0.addEventListener("disconnected", () => (leftLive = false));
 ctrl1.addEventListener("connected", () => (rightLive = true));
 ctrl1.addEventListener("disconnected", () => (rightLive = false));
-scene.add(ctrl0, ctrl1);
+player.add(ctrl0, ctrl1);
 
 // ---------------------------------------------------------------------------
 // Pose helpers
@@ -455,6 +521,8 @@ renderer.setAnimationLoop(() => {
     _camEuler.set(lookPitch, lookYaw, 0, "YXZ");
     camera.quaternion.setFromEuler(_camEuler);
     moveDesktop(dt);
+  } else {
+    moveVR(dt);
   }
   // Keep the spatial-audio listener on the active head (headset or desktop cam).
   const headSrc = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
