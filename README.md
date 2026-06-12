@@ -57,9 +57,27 @@ sends every older client a `reload` message and they refresh — so pushing to
 GitHub propagates to anyone currently connected. (In VR this drops them out of
 the session momentarily, which is unavoidable when swapping the running code.)
 
+## Controls
+
+**In VR:** tap *Enter VR*; your head and controllers drive your avatar.
+
+**On desktop (no headset):**
+- **Drag** the mouse to look around
+- **WASD** to walk (movement is relative to where you're looking)
+
+**Voice (both):** click **🎤 Enable voice** and grant mic access. Voice is
+spatial — each peer's audio comes from their avatar's position. On the headset,
+click *Enable voice* before tapping *Enter VR* so the mic prompt is handled on
+the flat page first.
+
+> Voice uses a WebRTC mesh signalled through PartyKit, with a public STUN server
+> only (no TURN). That connects across most home networks; if two peers are
+> behind strict/symmetric NATs it may fail to connect — add a TURN server if you
+> hit that.
+
 ## What to build next
 
 - Assign per-peer spawn offsets so you don't start overlapping the origin
-- Voice chat (WebRTC, or PartyKit-brokered)
 - Grabbable objects with authoritative ownership
-- Snap-turn / teleport locomotion to move around the lounge
+- Snap-turn / teleport locomotion for VR
+- Mute button + a "who's talking" indicator

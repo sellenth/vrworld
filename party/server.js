@@ -39,6 +39,25 @@ export default class Lounge {
     if (m.type === "pose") {
       m.id = sender.id;
       this.room.broadcast(JSON.stringify(m), [sender.id]);
+      return;
+    }
+
+    // --- Voice (WebRTC) signaling -------------------------------------------
+    // voice-on: broadcast "I have a mic". voice-ack: direct reply so the
+    // lower-id peer knows to initiate. rtc: relay offer/answer/ICE to one peer.
+    if (m.type === "voice-on") {
+      this.room.broadcast(JSON.stringify({ type: "voice-on", id: sender.id }), [sender.id]);
+      return;
+    }
+    if (m.type === "voice-ack") {
+      const c = this.room.getConnection(m.to);
+      if (c) c.send(JSON.stringify({ type: "voice-ack", id: sender.id }));
+      return;
+    }
+    if (m.type === "rtc") {
+      const c = this.room.getConnection(m.to);
+      if (c) c.send(JSON.stringify({ type: "rtc", from: sender.id, kind: m.kind, data: m.data }));
+      return;
     }
   }
 

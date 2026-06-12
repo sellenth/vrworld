@@ -15,6 +15,11 @@ scene.fog = new THREE.Fog(0x0b0f1a, 12, 45);
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
 camera.position.set(0, 1.6, 1.5);
 
+// Spatial-audio listener. Kept on the scene and driven each frame from the
+// active head pose so it tracks the headset in VR and the camera on desktop.
+const listener = new THREE.AudioListener();
+scene.add(listener);
+
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -61,6 +66,29 @@ window.addEventListener("mousemove", (e) => {
   prevX = e.clientX;
   prevY = e.clientY;
 });
+
+// WASD walking (desktop only). Movement is relative to where you're looking.
+const keys = new Set();
+window.addEventListener("keydown", (e) => keys.add(e.code));
+window.addEventListener("keyup", (e) => keys.delete(e.code));
+const MOVE_SPEED = 2.2; // metres/sec
+const FLOOR_RADIUS = 11;
+
+function moveDesktop(dt) {
+  const fwd = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
+  const strafe = (keys.has("KeyD") ? 1 : 0) - (keys.has("KeyA") ? 1 : 0);
+  if (!fwd && !strafe) return;
+  const s = Math.sin(lookYaw);
+  const c = Math.cos(lookYaw);
+  // forward = (-sin, 0, -cos), right = (cos, 0, -sin)
+  camera.position.x += (fwd * -s + strafe * c) * MOVE_SPEED * dt;
+  camera.position.z += (fwd * -c + strafe * -s) * MOVE_SPEED * dt;
+  const r = Math.hypot(camera.position.x, camera.position.z);
+  if (r > FLOOR_RADIUS) {
+    camera.position.x *= FLOOR_RADIUS / r;
+    camera.position.z *= FLOOR_RADIUS / r;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Environment: floor, grid, spawn origin
@@ -176,6 +204,7 @@ function upsertPeer(msg) {
 }
 
 function removePeer(id) {
+  closePeer(id);
   const a = peers.get(id);
   if (!a) return;
   scene.remove(a.group);
@@ -220,6 +249,7 @@ function updateAvatars() {
 const PARTY_HOST = import.meta.env.VITE_PARTYKIT_HOST || "127.0.0.1:1999";
 const socket = new PartySocket({ host: PARTY_HOST, room: "lounge" });
 let connected = false;
+let myId = null;
 
 socket.addEventListener("open", () => {
   connected = true;
@@ -235,11 +265,28 @@ socket.addEventListener("message", (e) => {
     return;
   }
   switch (m.type) {
+    case "welcome":
+      myId = m.id;
+      break;
     case "pose":
       upsertPeer(m);
       break;
     case "peer-leave":
       removePeer(m.id);
+      break;
+    case "voice-on":
+      // a peer has a mic. Lower id initiates; higher id acks so the lower
+      // one knows to start the offer.
+      if (voiceEnabled && myId) {
+        if (myId < m.id) ensurePeer(m.id, true);
+        else socket.send(JSON.stringify({ type: "voice-ack", to: m.id }));
+      }
+      break;
+    case "voice-ack":
+      if (voiceEnabled && myId && myId < m.id) ensurePeer(m.id, true);
+      break;
+    case "rtc":
+      onRtc(m.from, m.kind, m.data);
       break;
     case "reload":
       // a newer version was deployed — refresh to pick it up
@@ -247,6 +294,134 @@ socket.addEventListener("message", (e) => {
       break;
   }
 });
+
+// ---------------------------------------------------------------------------
+// Spatial voice chat (WebRTC mesh, signalled over PartyKit)
+// ---------------------------------------------------------------------------
+let voiceEnabled = false;
+let localStream = null;
+const pcs = new Map(); // peerId -> { pc, audioEl, posAudio }
+const RTC_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+function signal(to, kind, data) {
+  socket.send(JSON.stringify({ type: "rtc", to, kind, data }));
+}
+
+function ensurePeer(peerId, initiator) {
+  let entry = pcs.get(peerId);
+  if (entry) return entry;
+
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  entry = { pc, audioEl: null, posAudio: null };
+  pcs.set(peerId, entry);
+
+  if (localStream) {
+    for (const track of localStream.getTracks()) pc.addTrack(track, localStream);
+  }
+  pc.onicecandidate = (e) => {
+    if (e.candidate) signal(peerId, "ice", e.candidate);
+  };
+  pc.ontrack = (e) => attachRemoteAudio(peerId, e.streams[0]);
+  if (initiator) {
+    pc.onnegotiationneeded = async () => {
+      try {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        signal(peerId, "offer", offer);
+      } catch (err) {
+        console.warn("[voice] offer failed", err);
+      }
+    };
+  }
+  return entry;
+}
+
+async function onRtc(from, kind, data) {
+  if (!voiceEnabled) return;
+  if (kind === "offer") {
+    const entry = ensurePeer(from, false);
+    await entry.pc.setRemoteDescription(data);
+    const answer = await entry.pc.createAnswer();
+    await entry.pc.setLocalDescription(answer);
+    signal(from, "answer", answer);
+  } else if (kind === "answer") {
+    const entry = pcs.get(from);
+    if (entry) await entry.pc.setRemoteDescription(data);
+  } else if (kind === "ice") {
+    const entry = pcs.get(from);
+    if (entry) await entry.pc.addIceCandidate(data).catch(() => {});
+  }
+}
+
+function attachRemoteAudio(peerId, stream) {
+  const entry = pcs.get(peerId);
+  if (!entry) return;
+
+  // A muted <audio> element keeps Chrome's audio pipeline alive for streams
+  // that are otherwise only consumed by WebAudio (a long-standing quirk).
+  const el = document.createElement("audio");
+  el.srcObject = stream;
+  el.autoplay = true;
+  el.muted = true;
+  document.body.appendChild(el);
+  entry.audioEl = el;
+
+  const avatar = peers.get(peerId);
+  if (avatar) {
+    const pa = new THREE.PositionalAudio(listener);
+    pa.setMediaStreamSource(stream);
+    pa.setRefDistance(1.5);
+    pa.setDistanceModel("inverse");
+    avatar.group.add(pa);
+    entry.posAudio = pa;
+  } else {
+    // No avatar yet — fall back to flat audio so they're still audible.
+    el.muted = false;
+  }
+}
+
+function closePeer(peerId) {
+  const entry = pcs.get(peerId);
+  if (!entry) return;
+  try {
+    entry.pc.close();
+  } catch {}
+  if (entry.posAudio) {
+    entry.posAudio.disconnect();
+    entry.posAudio.parent?.remove(entry.posAudio);
+  }
+  if (entry.audioEl) entry.audioEl.remove();
+  pcs.delete(peerId);
+}
+
+async function enableVoice() {
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    voiceBtn.textContent = "🎤 mic blocked";
+    console.warn("[voice] getUserMedia failed", err);
+    return;
+  }
+  voiceEnabled = true;
+  if (listener.context.state === "suspended") await listener.context.resume();
+  voiceBtn.textContent = "🎤 voice on";
+  voiceBtn.disabled = true;
+  voiceBtn.style.opacity = "0.6";
+  // Any peers already connected may add their tracks now that we have a mic.
+  for (const [id, entry] of pcs) {
+    for (const track of localStream.getTracks()) entry.pc.addTrack(track, localStream);
+  }
+  socket.send(JSON.stringify({ type: "voice-on" }));
+}
+
+const voiceBtn = document.createElement("button");
+voiceBtn.textContent = "🎤 Enable voice";
+voiceBtn.style.cssText =
+  "position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:20;" +
+  "padding:10px 18px;border:0;border-radius:999px;background:#89b4fa;color:#0b0f1a;" +
+  "font:600 14px system-ui,sans-serif;cursor:pointer;";
+voiceBtn.addEventListener("click", enableVoice);
+document.body.appendChild(voiceBtn);
 
 // ---------------------------------------------------------------------------
 // Send our own pose ~20x/sec
@@ -279,7 +454,13 @@ renderer.setAnimationLoop(() => {
   if (!renderer.xr.isPresenting) {
     _camEuler.set(lookPitch, lookYaw, 0, "YXZ");
     camera.quaternion.setFromEuler(_camEuler);
+    moveDesktop(dt);
   }
+  // Keep the spatial-audio listener on the active head (headset or desktop cam).
+  const headSrc = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  headSrc.getWorldPosition(listener.position);
+  headSrc.getWorldQuaternion(listener.quaternion);
+
   sendPose(dt);
   updateAvatars();
   renderer.render(scene, camera);
