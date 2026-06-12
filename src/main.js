@@ -417,7 +417,7 @@ async function enableVoice() {
 const voiceBtn = document.createElement("button");
 voiceBtn.textContent = "🎤 Enable voice";
 voiceBtn.style.cssText =
-  "position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:20;" +
+  "position:fixed;bottom:16px;right:16px;z-index:20;" +
   "padding:10px 18px;border:0;border-radius:999px;background:#89b4fa;color:#0b0f1a;" +
   "font:600 14px system-ui,sans-serif;cursor:pointer;";
 voiceBtn.addEventListener("click", enableVoice);
