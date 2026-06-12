@@ -29,6 +29,40 @@ window.addEventListener("resize", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Desktop mouse-look (ignored in XR — the headset drives the camera there).
+// Click-drag to look around; the resulting head pose is what peers see.
+// ---------------------------------------------------------------------------
+const _camEuler = new THREE.Euler(0, 0, 0, "YXZ");
+let dragging = false;
+let prevX = 0;
+let prevY = 0;
+let lookYaw = 0; // 0 = looking down -Z, toward the origin from our spawn
+let lookPitch = 0;
+const LOOK_SPEED = 0.0025;
+const PITCH_LIMIT = Math.PI / 2 - 0.05;
+
+renderer.domElement.style.cursor = "grab";
+renderer.domElement.addEventListener("mousedown", (e) => {
+  if (renderer.xr.isPresenting) return;
+  dragging = true;
+  prevX = e.clientX;
+  prevY = e.clientY;
+  renderer.domElement.style.cursor = "grabbing";
+});
+window.addEventListener("mouseup", () => {
+  dragging = false;
+  renderer.domElement.style.cursor = "grab";
+});
+window.addEventListener("mousemove", (e) => {
+  if (!dragging || renderer.xr.isPresenting) return;
+  lookYaw -= (e.clientX - prevX) * LOOK_SPEED;
+  lookPitch -= (e.clientY - prevY) * LOOK_SPEED;
+  lookPitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, lookPitch));
+  prevX = e.clientX;
+  prevY = e.clientY;
+});
+
+// ---------------------------------------------------------------------------
 // Environment: floor, grid, spawn origin
 // ---------------------------------------------------------------------------
 scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x1a2030, 1.0));
@@ -242,6 +276,10 @@ function sendPose(dt) {
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = clock.getDelta();
+  if (!renderer.xr.isPresenting) {
+    _camEuler.set(lookPitch, lookYaw, 0, "YXZ");
+    camera.quaternion.setFromEuler(_camEuler);
+  }
   sendPose(dt);
   updateAvatars();
   renderer.render(scene, camera);
