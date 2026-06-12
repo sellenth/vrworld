@@ -60,6 +60,8 @@ the session momentarily, which is unavoidable when swapping the running code.)
 ## Controls
 
 **In VR:** tap *Enter VR*; your head and controllers drive your avatar.
+- **Left thumbstick** — glide (relative to where you look); **right thumbstick** — snap-turn
+- **No controllers?** With hand tracking, **pinch and hold** to glide forward where you're looking (turn physically). Auto-enabled whenever no thumbstick is detected.
 
 **On desktop (no headset):**
 - **Drag** the mouse to look around

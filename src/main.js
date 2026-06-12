@@ -33,7 +33,11 @@ renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.xr.enabled = true;
 document.body.appendChild(renderer.domElement);
-document.body.appendChild(VRButton.createButton(renderer));
+document.body.appendChild(
+  VRButton.createButton(renderer, {
+    optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"],
+  })
+);
 
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -117,11 +121,13 @@ function moveVR(dt) {
   let mx = 0;
   let mz = 0;
   let turn = 0;
+  let hasStick = false;
   for (const src of session.inputSources) {
     const ax = src.gamepad?.axes;
-    if (!ax) continue;
-    const x = ax.length > 2 ? ax[2] : ax[0] || 0; // thumbstick X
-    const y = ax.length > 3 ? ax[3] : ax[1] || 0; // thumbstick Y
+    if (!ax || ax.length < 4) continue; // hand inputs have no thumbstick
+    hasStick = true;
+    const x = ax[2]; // thumbstick X
+    const y = ax[3]; // thumbstick Y
     if (src.handedness === "right") turn += x;
     else {
       mx += x;
@@ -129,16 +135,23 @@ function moveVR(dt) {
     }
   }
 
-  // Smooth glide, relative to where the head is facing.
-  if (Math.hypot(mx, mz) > DEADZONE) {
-    renderer.xr.getCamera().getWorldQuaternion(_headQuat);
-    _camEuler.setFromQuaternion(_headQuat, "YXZ");
-    const s = Math.sin(_camEuler.y);
-    const c = Math.cos(_camEuler.y);
+  // Forward direction the head is facing (flattened to the floor plane).
+  renderer.xr.getCamera().getWorldQuaternion(_headQuat);
+  _camEuler.setFromQuaternion(_headQuat, "YXZ");
+  const s = Math.sin(_camEuler.y);
+  const c = Math.cos(_camEuler.y);
+
+  if (hasStick && Math.hypot(mx, mz) > DEADZONE) {
+    // Thumbstick: glide + strafe relative to gaze.
     const fwd = -mz;
     const strafe = mx;
     player.position.x += (fwd * -s + strafe * c) * VR_MOVE_SPEED * dt;
     player.position.z += (fwd * -c + strafe * -s) * VR_MOVE_SPEED * dt;
+    clampToFloor(player.position);
+  } else if (!hasStick && pinching.size > 0) {
+    // No controllers — pinch and hold to glide forward where you look.
+    player.position.x += -s * VR_MOVE_SPEED * dt;
+    player.position.z += -c * VR_MOVE_SPEED * dt;
     clampToFloor(player.position);
   }
 
@@ -202,6 +215,14 @@ ctrl0.addEventListener("disconnected", () => (leftLive = false));
 ctrl1.addEventListener("connected", () => (rightLive = true));
 ctrl1.addEventListener("disconnected", () => (rightLive = false));
 player.add(ctrl0, ctrl1);
+
+// "select" fires on trigger pull AND on a hand-tracking pinch. We use it for
+// controller-free locomotion (pinch-and-hold to glide).
+const pinching = new Set();
+ctrl0.addEventListener("selectstart", () => pinching.add(0));
+ctrl0.addEventListener("selectend", () => pinching.delete(0));
+ctrl1.addEventListener("selectstart", () => pinching.add(1));
+ctrl1.addEventListener("selectend", () => pinching.delete(1));
 
 // ---------------------------------------------------------------------------
 // Pose helpers
