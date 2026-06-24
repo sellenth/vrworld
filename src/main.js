@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { VRButton } from "three/examples/jsm/webxr/VRButton.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import PartySocket from "partysocket";
 
 /* global __BUILD_ID__ */
@@ -195,6 +196,95 @@ originRing.position.y = 0.011;
 scene.add(originRing);
 
 // ---------------------------------------------------------------------------
+// Generated models (fal.ai / Tripo text-to-3D)
+// The PartyKit server runs the job and broadcasts the GLB url; we load it,
+// normalise its size, and stand it on the origin ring. Only one at a time.
+// ---------------------------------------------------------------------------
+const gltfLoader = new GLTFLoader();
+let currentModel = null;
+
+function loadModel(url) {
+  genStatus.textContent = "Loading model…";
+  gltfLoader.load(
+    url,
+    (gltf) => {
+      const model = gltf.scene;
+      // Scale so the largest dimension is ~1.5m, then sit it on the floor (y=0)
+      // centred over the origin regardless of the model's native pivot.
+      const box = new THREE.Box3().setFromObject(model);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+      const scale = 1.5 / maxDim;
+      model.scale.setScalar(scale);
+      model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+
+      if (currentModel) {
+        scene.remove(currentModel);
+        currentModel.traverse((o) => {
+          o.geometry?.dispose?.();
+          if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((mtl) => mtl.dispose?.());
+        });
+      }
+      scene.add(model);
+      currentModel = model;
+      genStatus.textContent = "";
+    },
+    undefined,
+    (err) => {
+      console.warn("[gen] model load failed", err);
+      genStatus.textContent = "Couldn't load the model";
+    }
+  );
+}
+
+// In-world prompt box (HTML overlay — typeable on desktop / Quest browser).
+const genStatus = document.createElement("div");
+genStatus.style.cssText =
+  "position:fixed;bottom:64px;left:50%;transform:translateX(-50%);z-index:20;" +
+  "color:#89b4fa;font:13px system-ui,sans-serif;text-shadow:0 1px 4px #000;text-align:center;";
+document.body.appendChild(genStatus);
+
+const genWrap = document.createElement("div");
+genWrap.style.cssText =
+  "position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:20;" +
+  "display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:14px;" +
+  "background:rgba(11,15,26,0.85);border:1px solid #2a3550;backdrop-filter:blur(4px);";
+const genInput = document.createElement("input");
+genInput.type = "text";
+genInput.maxLength = 1024;
+genInput.placeholder = "Describe a 3D object to spawn…";
+genInput.style.cssText =
+  "width:min(60vw,300px);padding:9px 12px;border-radius:9px;border:1px solid #2a3550;" +
+  "background:#0b0f1a;color:#cdd6f4;font:14px system-ui,sans-serif;outline:none;";
+const genBtn = document.createElement("button");
+genBtn.textContent = "Generate";
+genBtn.style.cssText =
+  "padding:9px 16px;border:0;border-radius:9px;background:#89b4fa;color:#0b0f1a;" +
+  "font:600 14px system-ui,sans-serif;cursor:pointer;white-space:nowrap;";
+genWrap.append(genInput, genBtn);
+document.body.appendChild(genWrap);
+
+function submitGen() {
+  const prompt = genInput.value.trim();
+  if (!prompt) return;
+  if (!connected) {
+    genStatus.textContent = "Not connected yet…";
+    return;
+  }
+  socket.send(JSON.stringify({ type: "generate", prompt }));
+  genStatus.textContent = "Submitting…";
+  genInput.blur();
+}
+genBtn.addEventListener("click", submitGen);
+// Keep typing out of the WASD/locomotion handlers on window.
+genInput.addEventListener("keydown", (e) => {
+  e.stopPropagation();
+  if (e.key === "Enter") submitGen();
+});
+genInput.addEventListener("keyup", (e) => e.stopPropagation());
+
+// ---------------------------------------------------------------------------
 // Local player: controller grips + own hand spheres
 // ---------------------------------------------------------------------------
 const ownHandGeo = new THREE.SphereGeometry(0.05, 16, 12);
@@ -360,6 +450,15 @@ socket.addEventListener("message", (e) => {
       break;
     case "peer-leave":
       removePeer(m.id);
+      break;
+    case "model":
+      loadModel(m.url);
+      break;
+    case "gen-status":
+      if (m.state === "submitting") genStatus.textContent = `Generating “${m.prompt}”…`;
+      else if (m.state === "working") genStatus.textContent = `Generating “${m.prompt}”… (~1 min)`;
+      else if (m.state === "busy") genStatus.textContent = "Someone else is generating — try again shortly.";
+      else if (m.state === "error") genStatus.textContent = `Error: ${m.error || "generation failed"}`;
       break;
     case "voice-on":
       // a peer has a mic. Lower id initiates; higher id acks so the lower
