@@ -2,7 +2,7 @@
 // Relays pose updates between peers and coordinates live-reload on deploy.
 // Avatar poses are transient and reset when the room empties, but the most
 // recently generated model is remembered so late joiners see it at the origin.
-const FAL_ENDPOINT = "https://queue.fal.run/tripo3d/tripo/v2.5/text-to-3d";
+const FAL_ENDPOINT = "https://queue.fal.run/tripo3d/h3.1/text-to-3d";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export default class Lounge {
@@ -46,6 +46,14 @@ export default class Lounge {
     if (m.type === "pose") {
       m.id = sender.id;
       this.room.broadcast(JSON.stringify(m), [sender.id]);
+      return;
+    }
+
+    // --- Cube physics (networked playground) --------------------------------
+    // Pure relays: kicks replay the same impulse on every client, cube-sync is
+    // the authority peer streaming state for convergence, cube-reset restacks.
+    if (m.type === "cube-kick" || m.type === "cube-sync" || m.type === "cube-reset") {
+      this.room.broadcast(raw, [sender.id]);
       return;
     }
 
@@ -103,7 +111,9 @@ export default class Lounge {
       const submit = await fetch(FAL_ENDPOINT, {
         method: "POST",
         headers: { ...auth, "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, texture: "standard" }),
+        // Tripo H3.1 (newer than v2.5). "standard" quality keeps the GLB small
+        // enough to download quickly in a shared scene — "detailed" can be 50MB+.
+        body: JSON.stringify({ prompt, texture_quality: "standard", geometry_quality: "standard" }),
       });
       if (!submit.ok) throw new Error(`submit failed (${submit.status})`);
       const { status_url, response_url } = await submit.json();
@@ -125,7 +135,7 @@ export default class Lounge {
         }
       }
 
-      const url = result?.model_mesh?.url;
+      const url = result?.model_mesh?.url || result?.model_urls?.glb?.url;
       if (!url) throw new Error("no model returned");
       this.lastModel = { url, prompt, by: sender.id };
       this.room.broadcast(JSON.stringify({ type: "model", url, prompt, by: sender.id }));

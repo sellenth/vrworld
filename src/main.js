@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import * as CANNON from "cannon-es";
 import { VRButton } from "three/examples/jsm/webxr/VRButton.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import PartySocket from "partysocket";
@@ -81,8 +82,21 @@ window.addEventListener("mousemove", (e) => {
 });
 
 // WASD walking (desktop only). Movement is relative to where you're looking.
+// F fires a hitscan kick from the camera; R restacks the cubes for everyone.
 const keys = new Set();
-window.addEventListener("keydown", (e) => keys.add(e.code));
+window.addEventListener("keydown", (e) => {
+  keys.add(e.code);
+  if (e.code === "KeyF" && !renderer.xr.isPresenting) {
+    camera.getWorldPosition(_rayOrigin);
+    camera.getWorldQuaternion(_q);
+    _rayDir.set(0, 0, -1).applyQuaternion(_q);
+    fireKick(_rayOrigin, _rayDir);
+  }
+  if (e.code === "KeyR") {
+    resetCubes();
+    if (connected) socket.send(JSON.stringify({ type: "cube-reset" }));
+  }
+});
 window.addEventListener("keyup", (e) => keys.delete(e.code));
 const MOVE_SPEED = 2.6; // metres/sec
 const FLOOR_RADIUS = 24;
@@ -149,8 +163,9 @@ function moveVR(dt) {
     player.position.x += (fwd * -s + strafe * c) * VR_MOVE_SPEED * dt;
     player.position.z += (fwd * -c + strafe * -s) * VR_MOVE_SPEED * dt;
     clampToFloor(player.position);
-  } else if (!hasStick && pinching.size > 0) {
+  } else if (!hasStick && [...pinching].some((i) => !fistClosed[i])) {
     // No controllers — pinch and hold to glide forward where you look.
+    // (A closing fist can momentarily read as a pinch; punches don't glide.)
     player.position.x += -s * VR_MOVE_SPEED * dt;
     player.position.z += -c * VR_MOVE_SPEED * dt;
     clampToFloor(player.position);
@@ -194,6 +209,212 @@ const originRing = new THREE.Mesh(
 originRing.rotation.x = -Math.PI / 2;
 originRing.position.y = 0.011;
 scene.add(originRing);
+
+// ---------------------------------------------------------------------------
+// Physics playground: three stacks of cubes you can hitscan-kick around.
+// After https://gafferongames.com/post/networked_physics_in_virtual_reality/ —
+// every client runs the same cannon-es sim from the same initial state, kick
+// impulses are broadcast so all sims receive the identical hit, and the
+// lowest-id peer acts as authority, streaming cube state while anything is
+// awake so the sims converge instead of slowly drifting apart.
+// ---------------------------------------------------------------------------
+const CUBE_SIZE = 0.35;
+const STACK_HEIGHT = 5;
+const STACK_SPOTS = [
+  { x: -1.6, z: -1.4 },
+  { x: 1.6, z: -1.4 },
+  { x: 0, z: -2.6 },
+];
+const STACK_COLORS = [0xf38ba8, 0xa6e3a1, 0xfab387];
+
+const physWorld = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.81, 0) });
+physWorld.allowSleep = true;
+
+const groundPhysMat = new CANNON.Material("ground");
+const cubePhysMat = new CANNON.Material("cube");
+physWorld.addContactMaterial(
+  new CANNON.ContactMaterial(groundPhysMat, cubePhysMat, { friction: 0.5, restitution: 0.15 })
+);
+physWorld.addContactMaterial(
+  new CANNON.ContactMaterial(cubePhysMat, cubePhysMat, { friction: 0.4, restitution: 0.1 })
+);
+
+const groundBody = new CANNON.Body({ type: CANNON.Body.STATIC, shape: new CANNON.Plane(), material: groundPhysMat });
+groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+physWorld.addBody(groundBody);
+
+const cubes = []; // { mesh, body }, index is the shared network id of the cube
+{
+  const cubeGeo = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
+  const halfExtents = new CANNON.Vec3(CUBE_SIZE / 2, CUBE_SIZE / 2, CUBE_SIZE / 2);
+  for (let s = 0; s < STACK_SPOTS.length; s++) {
+    const mat = new THREE.MeshStandardMaterial({ color: STACK_COLORS[s], roughness: 0.65 });
+    for (let i = 0; i < STACK_HEIGHT; i++) {
+      const mesh = new THREE.Mesh(cubeGeo, mat);
+      scene.add(mesh);
+      const body = new CANNON.Body({
+        mass: 1,
+        shape: new CANNON.Box(halfExtents),
+        material: cubePhysMat,
+        allowSleep: true,
+        sleepSpeedLimit: 0.25,
+        sleepTimeLimit: 0.6,
+      });
+      physWorld.addBody(body);
+      cubes.push({ mesh, body });
+    }
+  }
+}
+
+function resetCubes() {
+  let n = 0;
+  for (let s = 0; s < STACK_SPOTS.length; s++) {
+    for (let i = 0; i < STACK_HEIGHT; i++) {
+      const { body } = cubes[n++];
+      // Deterministic sub-mm stagger: keeps the solver from treating the stack
+      // as perfectly degenerate while staying identical on every client.
+      const jx = (((s * 5 + i) % 3) - 1) * 0.004;
+      const jz = (((s * 3 + i) % 3) - 1) * 0.004;
+      body.position.set(STACK_SPOTS[s].x + jx, CUBE_SIZE / 2 + i * (CUBE_SIZE + 0.001), STACK_SPOTS[s].z + jz);
+      body.quaternion.set(0, 0, 0, 1);
+      body.velocity.setZero();
+      body.angularVelocity.setZero();
+      body.sleep(); // stacks hold still until something hits them
+    }
+  }
+}
+resetCubes();
+
+// --- hitscan kick ------------------------------------------------------------
+const KICK_IMPULSE = 5; // kg·m/s along the ray; cubes weigh 1 kg
+const raycaster = new THREE.Raycaster();
+const cubeMeshes = cubes.map((c) => c.mesh);
+const _rayOrigin = new THREE.Vector3();
+const _rayDir = new THREE.Vector3();
+const _impulse = new CANNON.Vec3();
+const _relPoint = new CANNON.Vec3();
+
+// Short-lived laser beams so kicks are visible (yours and your peers').
+const beams = []; // { line, mat, ttl }
+function flashBeam(origin, end) {
+  const geo = new THREE.BufferGeometry().setFromPoints([origin, end]);
+  const mat = new THREE.LineBasicMaterial({ color: 0x89b4fa, transparent: true, opacity: 0.9 });
+  const line = new THREE.Line(geo, mat);
+  scene.add(line);
+  beams.push({ line, mat, ttl: 0.18 });
+}
+
+function updateBeams(dt) {
+  for (let i = beams.length - 1; i >= 0; i--) {
+    const b = beams[i];
+    b.ttl -= dt;
+    if (b.ttl <= 0) {
+      scene.remove(b.line);
+      b.line.geometry.dispose();
+      b.mat.dispose();
+      beams.splice(i, 1);
+    } else {
+      b.mat.opacity = b.ttl / 0.18;
+    }
+  }
+}
+
+// Apply a kick impulse to cube `i` at world point `p`. Waking everything (not
+// just the hit cube) matters: sleeping cubes higher in a stack never get a
+// collision event when their support is blasted away, so they'd float.
+function applyKick(i, point, impulse) {
+  const cube = cubes[i];
+  if (!cube) return;
+  for (const c of cubes) c.body.wakeUp();
+  _impulse.set(impulse.x, impulse.y, impulse.z);
+  _relPoint.set(point.x - cube.body.position.x, point.y - cube.body.position.y, point.z - cube.body.position.z);
+  cube.body.applyImpulse(_impulse, _relPoint);
+}
+
+const _hitPoint = new THREE.Vector3();
+const _missEnd = new THREE.Vector3();
+function fireKick(origin, dir) {
+  raycaster.set(origin, dir);
+  raycaster.far = 30;
+  const hit = raycaster.intersectObjects(cubeMeshes, false)[0];
+  if (!hit) {
+    _missEnd.copy(dir).multiplyScalar(30).add(origin);
+    flashBeam(origin, _missEnd);
+    return;
+  }
+  _hitPoint.copy(hit.point);
+  flashBeam(origin, _hitPoint);
+  const i = cubeMeshes.indexOf(hit.object);
+  const impulse = { x: dir.x * KICK_IMPULSE, y: dir.y * KICK_IMPULSE, z: dir.z * KICK_IMPULSE };
+  applyKick(i, _hitPoint, impulse);
+  if (connected) {
+    socket.send(
+      JSON.stringify({
+        type: "cube-kick",
+        i,
+        o: [origin.x, origin.y, origin.z],
+        p: [_hitPoint.x, _hitPoint.y, _hitPoint.z],
+        j: [impulse.x, impulse.y, impulse.z],
+      })
+    );
+  }
+}
+
+// --- authority sync (gaffer-style convergence) -------------------------------
+// The connected peer with the lowest id owns the "true" cube state and streams
+// it at 10 Hz whenever any cube is awake. Everyone else snaps their bodies to
+// it; between snapshots their local sim keeps motion smooth.
+const SYNC_INTERVAL = 0.1;
+let syncAccum = 0;
+
+function isAuthority() {
+  if (!connected || !myId) return false;
+  for (const id of peers.keys()) if (id < myId) return false;
+  return true;
+}
+
+const _r3 = (x) => Math.round(x * 1000) / 1000;
+function sendCubeSync(dt, force = false) {
+  syncAccum += dt;
+  if (!connected || !isAuthority()) return;
+  // Periodic sends need someone listening and something moving; a forced send
+  // (peer-join catch-up) always goes out — the peers map may not yet include
+  // the newcomer whose join triggered it.
+  if (!force && (peers.size === 0 || syncAccum < SYNC_INTERVAL)) return;
+  if (!force && !cubes.some((c) => c.body.sleepState !== CANNON.Body.SLEEPING)) return;
+  syncAccum = 0;
+  const c = cubes.map(({ body: b }) => [
+    _r3(b.position.x), _r3(b.position.y), _r3(b.position.z),
+    _r3(b.quaternion.x), _r3(b.quaternion.y), _r3(b.quaternion.z), _r3(b.quaternion.w),
+    _r3(b.velocity.x), _r3(b.velocity.y), _r3(b.velocity.z),
+    _r3(b.angularVelocity.x), _r3(b.angularVelocity.y), _r3(b.angularVelocity.z),
+  ]);
+  socket.send(JSON.stringify({ type: "cube-sync", c }));
+}
+
+function applyCubeSync(c) {
+  if (!Array.isArray(c)) return;
+  for (let i = 0; i < c.length && i < cubes.length; i++) {
+    const d = c[i];
+    if (!Array.isArray(d) || d.length < 13) continue;
+    const b = cubes[i].body;
+    b.position.set(d[0], d[1], d[2]);
+    b.quaternion.set(d[3], d[4], d[5], d[6]);
+    b.velocity.set(d[7], d[8], d[9]);
+    b.angularVelocity.set(d[10], d[11], d[12]);
+    const moving = b.velocity.lengthSquared() > 1e-4 || b.angularVelocity.lengthSquared() > 1e-4;
+    if (moving) b.wakeUp();
+  }
+}
+
+function stepPhysics(dt) {
+  physWorld.step(1 / 60, dt, 4);
+  for (const c of cubes) {
+    c.mesh.position.copy(c.body.position);
+    c.mesh.quaternion.copy(c.body.quaternion);
+  }
+  updateBeams(dt);
+}
 
 // ---------------------------------------------------------------------------
 // Generated models (fal.ai / Tripo text-to-3D)
@@ -300,19 +521,95 @@ let leftLive = false;
 let rightLive = false;
 const ctrl0 = renderer.xr.getController(0);
 const ctrl1 = renderer.xr.getController(1);
-ctrl0.addEventListener("connected", () => (leftLive = true));
-ctrl0.addEventListener("disconnected", () => (leftLive = false));
-ctrl1.addEventListener("connected", () => (rightLive = true));
-ctrl1.addEventListener("disconnected", () => (rightLive = false));
 player.add(ctrl0, ctrl1);
 
-// "select" fires on trigger pull AND on a hand-tracking pinch. We use it for
-// controller-free locomotion (pinch-and-hold to glide).
+// Faint aim ray shown on the left controller so you can line up kicks.
+const aimRay = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -6)]),
+  new THREE.LineBasicMaterial({ color: 0x89b4fa, transparent: true, opacity: 0.35 })
+);
+
+function hookController(ctrl, index) {
+  ctrl.addEventListener("connected", (e) => {
+    if (index === 0) leftLive = true;
+    else rightLive = true;
+    if (e.data && !e.data.hand && e.data.handedness === "left") ctrl.add(aimRay);
+  });
+  ctrl.addEventListener("disconnected", () => {
+    if (index === 0) leftLive = false;
+    else rightLive = false;
+    if (aimRay.parent === ctrl) ctrl.remove(aimRay);
+  });
+}
+hookController(ctrl0, 0);
+hookController(ctrl1, 1);
+
+// "select" fires on trigger pull AND on a hand-tracking pinch. Pinch-and-hold
+// still drives controller-free locomotion; a *left controller* trigger pull
+// additionally fires a hitscan kick along the controller's pointing ray.
 const pinching = new Set();
-ctrl0.addEventListener("selectstart", () => pinching.add(0));
-ctrl0.addEventListener("selectend", () => pinching.delete(0));
-ctrl1.addEventListener("selectstart", () => pinching.add(1));
-ctrl1.addEventListener("selectend", () => pinching.delete(1));
+function hookSelect(ctrl, index) {
+  ctrl.addEventListener("selectstart", (e) => {
+    pinching.add(index);
+    const src = e.data;
+    if (src && !src.hand && src.handedness === "left") {
+      ctrl.getWorldPosition(_rayOrigin);
+      ctrl.getWorldQuaternion(_q);
+      _rayDir.set(0, 0, -1).applyQuaternion(_q);
+      fireKick(_rayOrigin, _rayDir);
+    }
+  });
+  ctrl.addEventListener("selectend", () => pinching.delete(index));
+}
+hookSelect(ctrl0, 0);
+hookSelect(ctrl1, 1);
+
+// --- hand tracking: punch (make a fist) to fire a kick -----------------------
+// Fist = all four fingertips curled in close to the wrist. The kick ray runs
+// wrist → middle knuckle, i.e. wherever the punch is aimed. Hysteresis on the
+// open/close thresholds stops one squeeze from firing repeatedly.
+const FIST_CLOSE = 0.1; // avg fingertip→wrist distance (m) to count as closed
+const FIST_OPEN = 0.13; // must re-open past this before the next punch
+const FINGERTIPS = ["index-finger-tip", "middle-finger-tip", "ring-finger-tip", "pinky-finger-tip"];
+const hands = [renderer.xr.getHand(0), renderer.xr.getHand(1)];
+player.add(hands[0], hands[1]);
+const fistClosed = [false, false];
+const _wristP = new THREE.Vector3();
+const _knuckleP = new THREE.Vector3();
+
+function updateFists() {
+  for (let i = 0; i < 2; i++) {
+    const joints = hands[i].joints;
+    const wrist = joints["wrist"];
+    const knuckle = joints["middle-finger-phalanx-proximal"];
+    if (!wrist || !knuckle) {
+      fistClosed[i] = false;
+      continue;
+    }
+    let sum = 0;
+    let n = 0;
+    for (const name of FINGERTIPS) {
+      const tip = joints[name];
+      if (!tip) continue;
+      sum += tip.position.distanceTo(wrist.position);
+      n++;
+    }
+    if (n < FINGERTIPS.length) {
+      fistClosed[i] = false;
+      continue;
+    }
+    const avg = sum / n;
+    if (!fistClosed[i] && avg < FIST_CLOSE) {
+      fistClosed[i] = true;
+      wrist.getWorldPosition(_wristP);
+      knuckle.getWorldPosition(_knuckleP);
+      _rayDir.copy(_knuckleP).sub(_wristP).normalize();
+      fireKick(_knuckleP, _rayDir);
+    } else if (fistClosed[i] && avg > FIST_OPEN) {
+      fistClosed[i] = false;
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Pose helpers
@@ -448,8 +745,28 @@ socket.addEventListener("message", (e) => {
     case "pose":
       upsertPeer(m);
       break;
+    case "peer-join":
+      // If we're the cube authority, catch the newcomer up on cube state so
+      // they don't see pristine stacks while everyone else sees rubble.
+      if (isAuthority()) sendCubeSync(0, true);
+      break;
     case "peer-leave":
       removePeer(m.id);
+      break;
+    case "cube-kick":
+      applyKick(m.i, { x: m.p[0], y: m.p[1], z: m.p[2] }, { x: m.j[0], y: m.j[1], z: m.j[2] });
+      if (Array.isArray(m.o)) {
+        flashBeam(new THREE.Vector3(m.o[0], m.o[1], m.o[2]), new THREE.Vector3(m.p[0], m.p[1], m.p[2]));
+      }
+      break;
+    case "cube-sync":
+      // Always apply — the server never echoes our own syncs back, and a
+      // fresh joiner's peers map is empty (it would wrongly think it's the
+      // authority and drop the catch-up state it was just sent).
+      applyCubeSync(m.c);
+      break;
+    case "cube-reset":
+      resetCubes();
       break;
     case "model":
       loadModel(m.url);
@@ -642,8 +959,11 @@ renderer.setAnimationLoop(() => {
     camera.quaternion.setFromEuler(_camEuler);
     moveDesktop(dt);
   } else {
+    updateFists(); // hand-tracking punch detection (fires kicks) before moving
     moveVR(dt);
   }
+  stepPhysics(dt);
+  sendCubeSync(dt);
   // Keep the spatial-audio listener on the active head (headset or desktop cam).
   const headSrc = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
   headSrc.getWorldPosition(listener.position);
